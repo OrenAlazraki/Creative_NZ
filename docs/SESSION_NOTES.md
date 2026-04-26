@@ -45,14 +45,41 @@ Boot timings on this machine:
 
 Symptom: `Could not locate the bindings file` from `better-sqlite3/lib/database.js` on `db:push`. Cause: prebuild-install can't find a Node 24 prebuilt for 11.x, falls back to `node-gyp` source build, which then fails with "Could not find any Python installation to use." The path of least resistance is to bump to `^12.9.0`. Documenting here so anyone hitting this on Node ≥24 knows it's a dependency-version issue, not their toolchain.
 
-### 2. OneDrive locks the working tree during `npm install`
+### 2. OneDrive locks the working tree — affects both install AND dev runtime
 
-Symptom: `EBUSY: resource busy or locked, rename ...node_modules\better-sqlite3 -> ...\.better-sqlite3-XXXX`. Cause: OneDrive sync is watching the folder and grabs a transient handle while npm renames the staging dir into place. **Workarounds, in order of preference:**
-- Retry the install — it's usually transient (the second run worked here).
-- Pause OneDrive sync for the duration of long npm operations.
-- Move the working tree out of OneDrive (e.g. `C:\dev\Creative_NZ`) to eliminate the class entirely. Recommended if you'll be reinstalling often.
+The first surface we hit was `EBUSY` during `npm install` on a `node_modules\better-sqlite3` rename. A retry got past it. The **second** surface, hit later when navigating to `/artist/[handle]` in the dev server, was much worse:
 
-This is a known risk for this user's setup — the working copy lives under `C:\Users\OrenA\OneDrive\` and `.git` corruption from sync interference is on the watchlist.
+```
+[Error: EBUSY: resource busy or locked, open
+  'C:\Users\OrenA\OneDrive\Claude-Code\Creative_NZ\.next\static\chunks\app\layout.js']
+```
+
+Once OneDrive started fighting `.next/`, every subsequent request returned **HTTP 500** because Next couldn't read its own compiled chunks. Restarting the dev server with a fresh `.next` did not help — OneDrive re-acquired locks the moment Next began re-emitting chunks.
+
+**Things we tried that did not work:**
+
+- **Relocating `.next` outside the project via `distDir: "../../../AppData/Local/kavaworks-next"`.** Next.js accepted the path but its runtime then threw `MODULE_NOT_FOUND` on `next/dist/compiled/next-server/app-page.runtime.dev.js` and `react/jsx-runtime`. Reason: bundled chunks emitted into `kavaworks-next/server/app/page.js` use `require(...)`, and Node walks UP from there looking for `node_modules/`, finds none, dies. `distDir` outside the project is effectively unsupported for `next dev` because the dev runtime needs `node_modules/` reachable from the build output.
+- **`outputFileTracingRoot` set to a parent directory above OneDrive.** Doesn't change the module-resolution problem above.
+
+**The fix that worked: move the working tree out of OneDrive entirely.**
+
+```
+git clone https://github.com/OrenAlazraki/Creative_NZ.git C:\dev\Creative_NZ
+cd C:\dev\Creative_NZ
+npm install --ignore-scripts
+npm install better-sqlite3 --foreground-scripts
+# (if the native binding is still missing, run prebuild-install directly:)
+node node_modules/prebuild-install/bin.js   # from inside node_modules/better-sqlite3
+npm run db:push && npm run db:seed && npm run dev
+```
+
+After the move:
+- All 10 sampled routes return 200 — including `/artist/[handle]` and `/market/[id]`, the dynamic routes that broke under OneDrive.
+- Both `http://localhost:3000` and `http://192.168.2.7:3000` (LAN) serve correctly.
+- Zero `EBUSY` events in the dev log over a full route walk.
+- Boot is faster too: `Ready in 2.5s` vs `3.7s` under OneDrive.
+
+**Why moving is the right call, not just pausing OneDrive.** Pausing fixes the symptom for one session but you'll forget. The repo lives on GitHub (your fork at `OrenAlazraki/Creative_NZ`) — OneDrive isn't actually backing up anything you don't already have remotely. The OneDrive copy at `C:\Users\OrenA\OneDrive\Claude-Code\Creative_NZ\` is now stale and can be deleted when convenient; **canonical local working copy is `C:\dev\Creative_NZ`**.
 
 ### 3. Security advisory: Next.js 15.2.0
 
@@ -83,8 +110,13 @@ The home route currently serves:
 
 ## Open questions / follow-ups
 
-- **Push destination.** Origin is `AsafAlazraki/Creative_NZ`, not `OrenAlazraki`. We have not pushed any of these changes. Decide between (a) fork to `OrenAlazraki` and push there, (b) PR against Asaf's repo from a fork, (c) push directly if write access is granted.
 - **CVE-2025-66478.** Bump Next.js to a patched 15.2.x in a dedicated commit and re-verify all routes.
 - **`engines` field.** `package.json` declares no `engines.node`. Adding `"engines": { "node": ">=20" }` would surface the Node 24/bsqlite3 issue at install time instead of mid-`db:push`.
 - **`db/migrations/` is in `.gitignore`** but `db:push` writes there. Drizzle's recommended pattern is to commit migrations so deploy environments can reproduce schema state. Leaving as-is for now since this is demo-only.
 - **Old artifacts.** `scripts/serve.sh` is now a thin wrapper around `npm run dev` — could be deleted entirely. Kept for parity with the README's old contract; revisit.
+- **Stale OneDrive copy.** The original local clone at `C:\Users\OrenA\OneDrive\Claude-Code\Creative_NZ\` is no longer the canonical working copy. Delete when convenient.
+
+## Resolved
+
+- **Push destination.** Forked to `OrenAlazraki/Creative_NZ` and pushed. Origin → fork, upstream → `AsafAlazraki/Creative_NZ`.
+- **OneDrive vs `.next/` EBUSY.** Resolved by moving the working tree to `C:\dev\Creative_NZ` (see Friction §2). All routes now return 200 over both localhost and LAN.
